@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
+from sklearn.metrics.pairwise import euclidean_distances
 from utils.procesado import plot_predicciones_arima
 from utils.clustering import cargar_datos_cluster, generar_clusters, recomendar
 from utils.minuto import sugerencias_por_intervalo
-from utils.prediccion_resultado import entrenar_modelo, predecir_resultado, obtener_nombre_equipo, obtener_rolling_stats_equipo
+from utils.prediccion_resultado import entrenar_modelo, predecir_resultado, obtener_nombre_equipo, obtener_rolling_stats_equipo, obtener_url_escudo
 
 # Set page configuration
 st.set_page_config(page_title="Análisis de Jugadores", layout="wide")
@@ -82,19 +84,184 @@ with tabs[0]:
 # --- TAB 2: Clustering ---
 with tabs[1]:
     st.title("👥 Jugadores Similares")
-    player_id = st.text_input("ID del jugador para recomendaciones:", key="rec_id")
-    tipo = st.checkbox("¿Buscar en centrocampistas?", key="pos_toggle")
-    tipo_pos = "Midfield" if tipo else "Attack"
-    if player_id.isdigit():
-        try:
-            df_stats, recomendaciones = recomendar(int(player_id), tipo_pos)
-            if recomendaciones is not None:
-                st.write("Jugadores similares:")
-                st.dataframe(recomendaciones)
-            else:
-                st.warning("Jugador no encontrado o sin datos suficientes.")
-        except Exception as e:
-            st.error(f"Error en clustering: {e}")
+    st.markdown("""
+    Este módulo utiliza clustering para identificar jugadores con un rendimiento similar al seleccionado, 
+    basado en estadísticas como goles, asistencias y minutos jugados.  
+    Selecciona un jugador y su posición para ver una lista de los 10 jugadores más cercanos en el mismo clúster.
+    """)
+
+    # Cargar lista de jugadores
+    player_options = None
+    try:
+        players_df = pd.read_csv("data/players.csv")
+        if not all(col in players_df.columns for col in ['player_id', 'name']):
+            raise ValueError("El archivo players.csv debe contener las columnas: player_id, name")
+        player_options = {row['name']: row['player_id'] for _, row in players_df.iterrows()}
+    except FileNotFoundError:
+        st.error("No se encontró 'data/players.csv'. Verifica la ruta del archivo.")
+    except ValueError as e:
+        st.error(str(e))
+    except Exception as e:
+        st.error(f"Error al cargar players.csv: {str(e)}")
+
+    if player_options:
+        player_name = st.selectbox(
+            "Selecciona un jugador:",
+            options=sorted(player_options.keys()),
+            key="rec_player"
+        )
+        player_id = player_options[player_name]
+    else:
+        player_id = st.text_input("Ingresa el ID del jugador:", "", key="rec_id")
+
+    # Selección de posiciones con dos checkboxes
+    st.markdown("**Selecciona las posiciones para buscar:**")
+    col1, col2 = st.columns(2)
+    with col1:
+        buscar_atacantes = st.checkbox("Atacantes", value=True, key="pos_attack")
+    with col2:
+        buscar_centrocampistas = st.checkbox("Centrocampistas", value=False, key="pos_midfield")
+
+    # Determinar las posiciones seleccionadas
+    tipo_posiciones = []
+    if buscar_atacantes:
+        tipo_posiciones.append("Attack")
+    if buscar_centrocampistas:
+        tipo_posiciones.append("Midfield")
+
+    # Validar que se haya seleccionado al menos una posición
+    if not tipo_posiciones:
+        st.warning("Por favor, selecciona al menos una posición (Atacantes o Centrocampistas).")
+        tipo_posiciones = ["Attack"]  # Valor por defecto si no se selecciona ninguna
+
+    if player_id:
+        with st.spinner("Procesando datos de clustering..."):
+            try:
+                # Validar que player_id sea numérico
+                if not player_options and not player_id.isdigit():
+                    raise ValueError("El ID del jugador debe ser numérico")
+                player_id = int(player_id)
+
+                df_stats, recomendaciones = recomendar(player_id, tipo_posiciones)
+                if recomendaciones is not None and not recomendaciones.empty:
+                    # Mostrar estadísticas del jugador seleccionado
+                    display_name = player_name if player_options else f"ID {player_id}"
+                    posiciones_str = ", ".join(tipo_posiciones)  # Convertir lista de posiciones a string
+                    st.subheader(f"Estadísticas de {display_name} ({posiciones_str})")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Goles", f"{int(df_stats.loc[player_id, 'goals'])}")
+                    col2.metric("Total Asistencias", f"{int(df_stats.loc[player_id, 'assists'])}")
+                    col3.metric("Partidos Jugados", f"{int(df_stats.loc[player_id, 'appearances'])}")
+
+                    # Calcular distancia euclidiana para encontrar los 10 más cercanos
+                    features = ['goals', 'assists', 'minutes_played', 'goals_per_game', 'assists_per_game']
+                    if not all(col in recomendaciones.columns for col in features):
+                        st.error(f"Faltan columnas en recomendaciones: {', '.join(features)}")
+                    else:
+                        # Extraer características del jugador seleccionado
+                        player_features = df_stats.loc[player_id, features].values.reshape(1, -1)
+                        # Extraer características de los jugadores recomendados
+                        recomendaciones_features = recomendaciones[features].values
+                        # Calcular distancias euclidianas
+                        distances = euclidean_distances(player_features, recomendaciones_features).flatten()
+                        # Añadir distancias al DataFrame
+                        recomendaciones['distance'] = distances
+                        # Excluir al jugador seleccionado (si está en recomendaciones)
+                        recomendaciones = recomendaciones[recomendaciones.index != player_id]
+                        # Ordenar por distancia y tomar los 10 más cercanos
+                        top_10_recomendaciones = recomendaciones.sort_values(by='distance').head(10)
+
+                        # Mostrar tabla de los 10 jugadores más cercanos
+                        st.subheader(f"Los 10 jugadores más similares a {display_name}")
+                        formatted_recommendations = top_10_recomendaciones.copy()
+                        formatted_recommendations = formatted_recommendations.rename(columns={
+                            'name': 'Nombre',
+                            'goals': 'Goles',
+                            'assists': 'Asistencias',
+                            'minutes_played': 'Minutos Jugados',
+                            'goals_per_game': 'Goles por Partido',
+                            'assists_per_game': 'Asistencias por Partido',
+                            'minutes_per_game': 'Minutos por Partido'
+                        })
+                        formatted_recommendations['Goles por Partido'] = formatted_recommendations['Goles por Partido'].round(2)
+                        formatted_recommendations['Asistencias por Partido'] = formatted_recommendations['Asistencias por Partido'].round(2)
+                        formatted_recommendations['Minutos por Partido'] = formatted_recommendations['Minutos por Partido'].round(2)
+                        # Excluir la columna 'distance' de la tabla
+                        formatted_recommendations = formatted_recommendations.drop(columns=['distance'])
+                        st.dataframe(
+                            formatted_recommendations,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        # Visualización con Plotly
+                        try:
+                            required_cols = ['goals_per_game', 'assists_per_game', 'name']
+                            if all(col in top_10_recomendaciones.columns for col in required_cols) and all(col in df_stats.columns for col in required_cols):
+                                # Filtrar filas con valores no nulos
+                                top_10_recomendaciones = top_10_recomendaciones.dropna(subset=['goals_per_game', 'assists_per_game'])
+                                if not top_10_recomendaciones.empty:
+                                    st.subheader("Visualización de Jugadores Similares")
+                                    st.markdown("El gráfico muestra los 10 jugadores más cercanos en el mismo clúster, comparando goles y asistencias por partido.")
+
+                                    # Crear DataFrame para Plotly
+                                    plot_data = top_10_recomendaciones[['name', 'goals_per_game', 'assists_per_game']].copy()
+                                    plot_data['Type'] = 'Jugadores Similares'
+
+                                    # Datos del jugador seleccionado
+                                    if pd.notna(df_stats.loc[player_id, 'goals_per_game']) and pd.notna(df_stats.loc[player_id, 'assists_per_game']):
+                                        selected_player = pd.DataFrame({
+                                            'name': [df_stats.loc[player_id, 'name']],
+                                            'goals_per_game': [df_stats.loc[player_id, 'goals_per_game']],
+                                            'assists_per_game': [df_stats.loc[player_id, 'assists_per_game']],
+                                            'Type': [f"{display_name} (Seleccionado)"]
+                                        })
+                                        plot_data = pd.concat([plot_data, selected_player], ignore_index=True)
+                                    else:
+                                        st.warning("El jugador seleccionado no tiene datos suficientes para graficar (goals_per_game o assists_per_game faltantes).")
+
+                                    # Crear gráfico si hay datos
+                                    if not plot_data.empty:
+                                        fig = px.scatter(
+                                            plot_data,
+                                            x='goals_per_game',
+                                            y='assists_per_game',
+                                            color='Type',
+                                            hover_data=['name'],
+                                            labels={'goals_per_game': 'Goles por Partido', 'assists_per_game': 'Asistencias por Partido'},
+                                            title='Jugadores Similares (Top 10)'
+                                        )
+                                        fig.update_traces(marker=dict(size=10), selector=dict(name='Jugadores Similares'))
+                                        fig.update_traces(marker=dict(size=15, line=dict(width=2, color='DarkSlateGrey')), selector=dict(name=f"{display_name} (Seleccionado)"))
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    else:
+                                        st.warning("No hay datos suficientes para generar el gráfico.")
+                                else:
+                                    st.warning("No se pueden generar gráficos: los jugadores recomendados tienen datos faltantes (goals_per_game o assists_per_game).")
+                            else:
+                                st.warning("No se pueden generar gráficos debido a columnas faltantes (goals_per_game, assists_per_game o name).")
+                        except Exception as e:
+                            st.error(f"Error al generar el gráfico: {str(e)}")
+
+                        # Opción para descargar la tabla
+                        csv = formatted_recommendations.to_csv(index=False)
+                        st.download_button(
+                            label="Descargar tabla como CSV",
+                            data=csv,
+                            file_name=f"jugadores_similares_{display_name}.csv",
+                            mime="text/csv"
+                        )
+
+                else:
+                    st.warning("Jugador no encontrado o sin datos suficientes.")
+            except ValueError as e:
+                st.error(f"Error de datos: {str(e)}")
+            except KeyError as e:
+                st.error(f"Error: No se encontró la columna o índice {str(e)} en los datos")
+            except Exception as e:
+                st.error(f"Error en clustering: {str(e)}")
+    else:
+        st.info("Por favor, selecciona un jugador para ver las recomendaciones.")
 
 # --- TAB 3: Interval Suggestions ---
 with tabs[2]:
@@ -185,17 +352,31 @@ with tabs[3]:
                     col1, col2 = st.columns(2)
                     with col1:
                         st.markdown(f"**{home_team_name} (Local)**")
+                        # Obtener la URL del escudo para el equipo local
                         url_home = clubs_df.loc[clubs_df["club_id"] == home_id, "url"].values[0] if home_id in clubs_df["club_id"].values else None
                         if url_home:
-                            st.image(url_home, width=150)
+                            img_url_home = obtener_url_escudo(url_home)
+                            if img_url_home:
+                                st.image(img_url_home, width=100)  # Reducir a 100 píxeles
+                            else:
+                                st.warning(f"No se pudo cargar el escudo de {home_team_name}.")
+                        else:
+                            st.warning(f"No se encontró URL para {home_team_name}.")
                         st.metric("Promedio Goles a Favor", f"{last_home_stats['goals_for_rolling']:.2f}")
                         st.metric("Promedio Goles en Contra", f"{last_home_stats['goals_against_rolling']:.2f}")
                         st.metric("Tasa de Victoria", f"{last_home_stats['win_rate_rolling']:.2f}")
                     with col2:
                         st.markdown(f"**{away_team_name} (Visitante)**")
+                        # Obtener la URL del escudo para el equipo visitante
                         url_away = clubs_df.loc[clubs_df["club_id"] == away_id, "url"].values[0] if away_id in clubs_df["club_id"].values else None
                         if url_away:
-                            st.image(url_away, width=150)
+                            img_url_away = obtener_url_escudo(url_away)
+                            if img_url_away:
+                                st.image(img_url_away, width=100)  # Reducir a 100 píxeles
+                            else:
+                                st.warning(f"No se pudo cargar el escudo de {away_team_name}.")
+                        else:
+                            st.warning(f"No se encontró URL para {away_team_name}.")
                         st.metric("Promedio Goles a Favor", f"{last_away_stats['goals_for_rolling']:.2f}")
                         st.metric("Promedio Goles en Contra", f"{last_away_stats['goals_against_rolling']:.2f}")
                         st.metric("Tasa de Victoria", f"{last_away_stats['win_rate_rolling']:.2f}")

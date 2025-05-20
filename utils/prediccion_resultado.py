@@ -2,6 +2,8 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 import os
+import requests
+from bs4 import BeautifulSoup
 
 def entrenar_modelo(games_path="data/games.csv"):
     try:
@@ -19,7 +21,7 @@ def entrenar_modelo(games_path="data/games.csv"):
 
         away_df = games[['date', 'away_club_id', 'home_club_id', 'away_club_goals', 'home_club_goals']].copy()
         away_df['team_id'] = away_df['away_club_id']
-        away_df['opponent_id'] = away_df['home_club_id']  # Fixed typo: was using home_df['home_club_id']
+        away_df['opponent_id'] = away_df['home_club_id']
         away_df['is_home'] = 0
         away_df['goals_for'] = away_df['away_club_goals']
         away_df['goals_against'] = away_df['home_club_goals']
@@ -64,41 +66,24 @@ def entrenar_modelo(games_path="data/games.csv"):
             'goals_against_rolling': 'away_goals_conceded_avg',
             'goal_diff_rolling': 'away_goal_diff_avg',
             'win_rate_rolling': 'away_win_rate',
-            'result': 'match_result_away'  # Rename result for away_stats to avoid conflict
+            'result': 'match_result_away'
         })
-
-        # Debugging: Inspect columns before merge
-        print("home_stats columns:", home_stats.columns.tolist())
-        print("away_stats columns:", away_stats.columns.tolist())
 
         df_model = pd.merge(home_stats, away_stats, on=['date', 'home_team', 'away_team'], how='inner')
 
-        # Debugging: Inspect df_model columns
-        print("df_model columns:", df_model.columns.tolist())
         if df_model.empty:
             raise ValueError("Merge resulted in an empty DataFrame. Check data alignment or matches.")
 
-        # Use match_result from home_stats
         if 'match_result' not in df_model.columns:
             raise KeyError("match_result column not found in df_model. Check merge and column renaming.")
         df_model['target'] = df_model['match_result'].map({'W': 1, 'D': 0, 'L': -1})
 
-        # Explicitly select numerical columns for X
         numerical_columns = [
             'home_goals_avg', 'home_goals_conceded_avg', 'home_goal_diff_avg', 'home_win_rate',
             'away_goals_avg', 'away_goals_conceded_avg', 'away_goal_diff_avg', 'away_win_rate'
         ]
         X = df_model[numerical_columns]
         y = df_model['target']
-
-        # Debugging: Print columns and check for non-numeric data
-        print("Columns in X:", X.columns.tolist())
-        print("Sample of X:\n", X.head())
-        print("Data types in X:\n", X.dtypes)
-
-        # Ensure no non-numeric columns remain
-        if not all(X.dtypes.apply(lambda x: pd.api.types.is_numeric_dtype(x))):
-            raise ValueError("Non-numeric data found in X: " + str(X.dtypes))
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
@@ -142,3 +127,33 @@ def obtener_nombre_equipo(club_id, clubs_df):
         return fila.iloc[0]["name"]
     else:
         return f"Equipo {club_id}"
+
+def obtener_url_escudo(club_url):
+    try:
+        # Hacer una solicitud HTTP a la página del club
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(club_url, headers=headers)
+        response.raise_for_status()  # Lanzar excepción si hay error en la solicitud
+
+        # Analizar el HTML con BeautifulSoup
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Buscar la imagen del escudo
+        img_tag = soup.find('img', class_='tiny_wappen')
+        if not img_tag:
+            # Alternativa: buscar en el header del club
+            img_tag = soup.find('div', class_='data-header__club-info').find('img') if soup.find('div', class_='data-header__club-info') else None
+
+        if img_tag and 'src' in img_tag.attrs:
+            img_url = img_tag['src']
+            # Intentar obtener una versión de mayor resolución (reemplazar 'head' por 'big')
+            img_url_high_res = img_url.replace('head', 'big') if 'head' in img_url else img_url
+            # Asegurarse de que la URL sea absoluta
+            if not img_url_high_res.startswith('http'):
+                img_url_high_res = 'https://www.transfermarkt.co.uk' + img_url_high_res
+            return img_url_high_res
+        else:
+            return None
+    except Exception as e:
+        print(f"Error al obtener la URL del escudo desde {club_url}: {e}")
+        return None
